@@ -1,17 +1,20 @@
 """
-NBA Player Prop Hit-Rate Dashboard (Streamlit)
-----------------------------------------------
-Interactive web UI with -time sliders for Points, Assists, and Rebounds
-thresholds, clean per-strealat tabs, matchup filtering, and fair implied odds.
+NBA Player Prop Hit-Rate Dashboard (Streamlit — CSV-First)
+-----------------------------------------------------------
+Loads pre-fetched `nba_logs.csv` (and optional `today_matchups.csv`) directly
+from the repository so the dashboard boots in <1 second on Streamlit Community
+Cloud without hitting stats.nba.com from cloud IPs.
 
 Requirements:
-    pip install streamlit nba-api pandas
+    pip install streamlit pandas
 
-Run:
+Run locally:
     python -m streamlit run nba_prop_app.py
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -22,48 +25,25 @@ st.set_page_config(
     layout="wide",
 )
 
-
-def get_current_nba_season(reference_date: pd.Timestamp | None = None) -> str:
-    """Return the NBA season string (e.g. '2026-27') for a given date."""
-    ts = reference_date or pd.Timestamp.today()
-    start_year = ts.year if ts.month >= 10 else ts.year - 1
-    return f"{start_year}-{str(start_year + 1)[-2:]}"
+LOGS_CSV = Path("nba_logs.csv")
+MATCHUPS_CSV = Path("today_matchups.csv")
 
 
-@st.cache_data(ttl=21600, show_spinner="Fetching season game logs from NBA.com...")
-def fetch_league_player_logs(season: str) -> pd.DataFrame:
-    """Fetch all player game logs for the season in ONE cached API call."""
-    from nba_api.stats.endpoints import LeagueGameLog
-
-    log = LeagueGameLog(
-        season=season,
-        season_type_all_star="Regular Season",
-        player_or_team_abbreviation="P",
-        sorter="DATE",
-        direction="DESC",
-        timeout=30,
-    )
-    df = log.get_data_frames()[0]
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    return df
+@st.cache_data(ttl=300)
+def load_csv_logs(path_str: str, mtime: float) -> pd.DataFrame:
+    """Load player game logs from CSV; `mtime` busts cache when CSV updates."""
+    _ = mtime
+    return pd.read_csv(path_str, parse_dates=["GAME_DATE"])
 
 
-@st.cache_data(ttl=3600, show_spinner="Checking today's NBA schedule...")
-def fetch_matchups_on_date(game_date: str) -> list[tuple[str, str]]:
-    """Return (away_abbr, home_abbr) matchups for `game_date` (YYYY-MM-DD)."""
-    from nba_api.stats.endpoints import ScoreboardV2
-
-    sb = ScoreboardV2(game_date=game_date, league_id="00", day_offset=0, timeout=30)
-    line_score = sb.line_score.get_data_frame()
-    if line_score.empty:
+@st.cache_data(ttl=300)
+def load_csv_matchups(path_str: str, mtime: float) -> list[tuple[str, str]]:
+    """Load today's (away, home) matchups from CSV if present."""
+    _ = mtime
+    df = pd.read_csv(path_str)
+    if df.empty or not {"AWAY", "HOME"}.issubset(df.columns):
         return []
-
-    matchups: list[tuple[str, str]] = []
-    for _, group in line_score.groupby("GAME_ID", sort=False):
-        abbrs = group["TEAM_ABBREVIATION"].tolist()
-        if len(abbrs) == 2:
-            matchups.append((abbrs[0], abbrs[1]))
-    return matchups
+    return list(zip(df["AWAY"].astype(str), df["HOME"].astype(str)))
 
 
 def build_demo_logs() -> pd.DataFrame:
@@ -247,7 +227,7 @@ def render_stat_table(
     stat: str,
     breakeven_pct: float,
 ) -> None:
-    """Render a clean 8-column table for a single stat category."""
+    """Render a clean, focused table for a single stat category."""
     avg_col = f"Avg {stat}"
     hits_col = f"{stat} Hits"
     pct_col = f"{stat} %"
@@ -296,9 +276,7 @@ def render_stat_table(
 def render_overview_table(summary: pd.DataFrame) -> None:
     """Render a compact all-stats comparison table."""
     view = (
-        summary[
-            ["Player", "Team", "GP", "Avg MIN", "PTS %", "AST %", "REB %"]
-        ]
+        summary[["Player", "Team", "GP", "Avg MIN", "PTS %", "AST %", "REB %"]]
         .sort_values(["PTS %", "AST %", "REB %"], ascending=False)
         .reset_index(drop=True)
     )
@@ -308,25 +286,26 @@ def render_overview_table(summary: pd.DataFrame) -> None:
         hide_index=True,
         column_config={
             "Avg MIN": st.column_config.NumberColumn(format="%.1f"),
-            "PTS %": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-            "AST %": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-            "REB %": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+            "PTS %": st.column_config.ProgressColumn(
+                format="%.1f%%", min_value=0, max_value=100
+            ),
+            "AST %": st.column_config.ProgressColumn(
+                format="%.1f%%", min_value=0, max_value=100
+            ),
+            "REB %": st.column_config.ProgressColumn(
+                format="%.1f%%", min_value=0, max_value=100
+            ),
         },
     )
 
 
 def main() -> None:
     st.title("NBA Player Prop Hit-Rate Analyzer")
-    st.caption(
-        "Slide thresholds in the sidebar and switch tabs for clean Points, Assists, and Rebounds views."
-    )
 
     with st.sidebar:
         st.header("Data Source")
         use_demo = st.toggle("Use offline sample data", value=False)
-        season = st.text_input("Season", value=get_current_nba_season())
-
-        if st.button("Refresh NBA data", use_container_width=True):
+        if st.button("Reload CSV", use_container_width=True):
             st.cache_data.clear()
 
         st.divider()
@@ -351,10 +330,18 @@ def main() -> None:
             help="Marks players whose hit rate beats this line's breakeven probability.",
         )
 
-    try:
-        logs_df = build_demo_logs() if use_demo else fetch_league_player_logs(season)
-    except Exception as exc:
-        st.error(f"Could not fetch live NBA data ({exc}). Toggle 'Use offline sample data' to test.")
+    if use_demo:
+        logs_df = build_demo_logs()
+        st.caption("Showing built-in sample data.")
+    elif LOGS_CSV.exists():
+        logs_df = load_csv_logs(str(LOGS_CSV), LOGS_CSV.stat().st_mtime)
+        latest_game = pd.to_datetime(logs_df["GAME_DATE"]).max().strftime("%Y-%m-%d")
+        st.caption(f"Loaded `nba_logs.csv` ({len(logs_df):,} player-games, latest game: {latest_game}).")
+    else:
+        st.warning(
+            "`nba_logs.csv` was not found in this repo. Run `python update_nba_data.py` "
+            "on your PC and upload `nba_logs.csv`, or toggle **Use offline sample data**."
+        )
         return
 
     all_teams = sorted(logs_df["TEAM_ABBREVIATION"].dropna().unique().tolist())
@@ -363,15 +350,13 @@ def main() -> None:
     with col1:
         matchup_options = ["All Teams"]
         matchup_map: dict[str, list[str]] = {}
-        if not use_demo:
-            today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
-            try:
-                for away, home in fetch_matchups_on_date(today_str):
-                    label = f"{away} @ {home} (Today)"
-                    matchup_options.append(label)
-                    matchup_map[label] = [away, home]
-            except Exception:
-                pass
+        if not use_demo and MATCHUPS_CSV.exists():
+            for away, home in load_csv_matchups(
+                str(MATCHUPS_CSV), MATCHUPS_CSV.stat().st_mtime
+            ):
+                label = f"{away} @ {home}"
+                matchup_options.append(label)
+                matchup_map[label] = [away, home]
 
         selected_matchup = st.selectbox("Matchup", options=matchup_options)
         default_teams = matchup_map.get(selected_matchup, [])
