@@ -118,13 +118,6 @@ def hit_rate_to_american_odds(hit_rate: float) -> str:
     return f"+{round(((1.0 - hit_rate) / hit_rate) * 100)}"
 
 
-def american_odds_to_implied_prob(odds: int) -> float:
-    """Convert American odds (e.g. -110, +150) to implied breakeven probability."""
-    if odds < 0:
-        return abs(odds) / (abs(odds) + 100.0)
-    return 100.0 / (odds + 100.0)
-
-
 def analyze_player_thresholds(
     logs_df: pd.DataFrame,
     pts_threshold: int,
@@ -177,7 +170,6 @@ def analyze_player_thresholds(
         df.groupby(["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION"], as_index=False)
         .agg(
             GP=("GAME_ID", "count"),
-            AVG_MIN=("MIN_NUM", "mean"),
             AVG_PTS=("PTS", "mean"),
             PTS_HITS=("HIT_PTS", "sum"),
             PTS_RATE=("HIT_PTS", "mean"),
@@ -209,45 +201,34 @@ def analyze_player_thresholds(
         columns={
             "PLAYER_NAME": "Player",
             "TEAM_ABBREVIATION": "Team",
-            "AVG_MIN": "Avg MIN",
             "AVG_PTS": "Avg PTS",
             "AVG_AST": "Avg AST",
             "AVG_REB": "Avg REB",
         }
     )
 
-    for col in ("Avg MIN", "Avg PTS", "Avg AST", "Avg REB"):
+    for col in ("Avg PTS", "Avg AST", "Avg REB"):
         summary[col] = summary[col].round(1)
 
     return summary.reset_index(drop=True)
 
 
-def render_stat_table(
-    summary: pd.DataFrame,
-    stat: str,
-    breakeven_pct: float,
-) -> None:
-    """Render a clean, focused table for a single stat category."""
+def render_stat_table(summary: pd.DataFrame, stat: str) -> None:
+    """Render a clean 5-column table with combined Hit Rate (e.g. '90.0% (9/10)')."""
     avg_col = f"Avg {stat}"
     hits_col = f"{stat} Hits"
     pct_col = f"{stat} %"
     odds_col = f"{stat} Fair Odds"
 
-    view = (
-        summary[["Player", "Team", "GP", "Avg MIN", avg_col, hits_col, pct_col, odds_col]]
-        .rename(
-            columns={
-                avg_col: "Avg",
-                hits_col: "Hits",
-                pct_col: "Hit Rate",
-                odds_col: "Fair Odds",
-            }
-        )
-        .sort_values(["Hit Rate", "Avg"], ascending=[False, False])
-        .reset_index(drop=True)
-    )
-    view["Value"] = view["Hit Rate"].apply(
-        lambda x: "Beats Line" if x >= breakeven_pct else "Below Line"
+    sorted_df = summary.sort_values([pct_col, avg_col], ascending=[False, False]).reset_index(drop=True)
+    view = pd.DataFrame(
+        {
+            "Player": sorted_df["Player"],
+            "Team": sorted_df["Team"],
+            "Avg": sorted_df[avg_col],
+            "Hit Rate": sorted_df[pct_col].map(lambda x: f"{x:.1f}%") + " (" + sorted_df[hits_col] + ")",
+            "Fair Odds": sorted_df[odds_col],
+        }
     )
 
     st.dataframe(
@@ -257,18 +238,9 @@ def render_stat_table(
         column_config={
             "Player": st.column_config.TextColumn(width="medium"),
             "Team": st.column_config.TextColumn(width="small"),
-            "GP": st.column_config.NumberColumn(width="small"),
-            "Avg MIN": st.column_config.NumberColumn(format="%.1f", width="small"),
             "Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
-            "Hits": st.column_config.TextColumn(width="small"),
-            "Hit Rate": st.column_config.ProgressColumn(
-                format="%.1f%%",
-                min_value=0,
-                max_value=100,
-                width="medium",
-            ),
+            "Hit Rate": st.column_config.TextColumn(width="small"),
             "Fair Odds": st.column_config.TextColumn(width="small"),
-            "Value": st.column_config.TextColumn(width="small"),
         },
     )
 
@@ -276,7 +248,7 @@ def render_stat_table(
 def render_overview_table(summary: pd.DataFrame) -> None:
     """Render a compact all-stats comparison table."""
     view = (
-        summary[["Player", "Team", "GP", "Avg MIN", "PTS %", "AST %", "REB %"]]
+        summary[["Player", "Team", "PTS %", "AST %", "REB %"]]
         .sort_values(["PTS %", "AST %", "REB %"], ascending=False)
         .reset_index(drop=True)
     )
@@ -285,7 +257,6 @@ def render_overview_table(summary: pd.DataFrame) -> None:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Avg MIN": st.column_config.NumberColumn(format="%.1f"),
             "PTS %": st.column_config.ProgressColumn(
                 format="%.1f%%", min_value=0, max_value=100
             ),
@@ -323,12 +294,6 @@ def main() -> None:
             else st.slider("Last N games", min_value=3, max_value=40, value=10, step=1)
         )
         min_minutes = st.slider("Minimum minutes played", min_value=0, max_value=30, value=10)
-        book_odds = st.number_input(
-            "Sportsbook odds to beat (American)",
-            value=-110,
-            step=5,
-            help="Marks players whose hit rate beats this line's breakeven probability.",
-        )
 
     if use_demo:
         logs_df = build_demo_logs()
@@ -368,11 +333,6 @@ def main() -> None:
 
     with col2:
         player_query = st.text_input("Search player name", placeholder="e.g. Brunson")
-        breakeven_pct = american_odds_to_implied_prob(int(book_odds)) * 100.0
-        st.metric(
-            label=f"Breakeven Hit Rate at {int(book_odds):+d}",
-            value=f"{breakeven_pct:.1f}%",
-        )
 
     result = analyze_player_thresholds(
         logs_df,
@@ -399,11 +359,11 @@ def main() -> None:
     )
 
     with tab_pts:
-        render_stat_table(result, "PTS", breakeven_pct)
+        render_stat_table(result, "PTS")
     with tab_ast:
-        render_stat_table(result, "AST", breakeven_pct)
+        render_stat_table(result, "AST")
     with tab_reb:
-        render_stat_table(result, "REB", breakeven_pct)
+        render_stat_table(result, "REB")
     with tab_all:
         render_overview_table(result)
 
