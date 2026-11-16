@@ -14,13 +14,15 @@ Run locally:
 
 from __future__ import annotations
 
+import json
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="NBA Prop Hit-Rate Analyzer",
+    page_title="NBA Prop Analyzer",
     page_icon="🏀",
     layout="wide",
 )
@@ -44,6 +46,87 @@ def load_csv_matchups(path_str: str, mtime: float) -> list[tuple[str, str]]:
     if df.empty or not {"AWAY", "HOME"}.issubset(df.columns):
         return []
     return list(zip(df["AWAY"].astype(str), df["HOME"].astype(str)))
+
+
+@st.cache_data(ttl=1800)
+def fetch_nba_injuries() -> dict[str, str]:
+    """
+    Fetch current NBA injury statuses from ESPN's public endpoint.
+    Returns {lowercase_player_name: '❌ Out' / '⚠️ Day-To-Day' / ...}.
+    """
+    url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+    injuries: dict[str, str] = {}
+    for team_entry in data.get("injuries", []):
+        for item in team_entry.get("injuries", []):
+            name = (
+                item.get("athlete", {}).get("displayName", "")
+                .strip()
+                .lower()
+            )
+            status = str(item.get("status", "")).strip()
+            if not name or not status:
+                continue
+            status_lower = status.lower()
+            if "out" in status_lower:
+                badge = f"❌ {status}"
+            elif any(k in status_lower for k in ("day-to-day", "questionable", "doubtful")):
+                badge = f"⚠️ {status}"
+            else:
+                badge = f"🤕 {status}"
+            injuries[name] = badge
+    return injuries
+
+
+def get_player_streak_badges(
+    logs_df: pd.DataFrame,
+    min_streak: int = 3,
+    min_minutes: int = 10,
+) -> dict[str, str]:
+    """Return {lowercase_player_name: '🔥 PTS, AST'} for active streaks."""
+    streaks_df = compute_heater_streaks(
+        logs_df,
+        stat_filter="All",
+        min_streak=min_streak,
+        min_minutes=min_minutes,
+    )
+    if streaks_df.empty:
+        return {}
+
+    badges: dict[str, str] = {}
+    for player_name, group in streaks_df.groupby("Player", sort=False):
+        stats_list = group["Stat"].tolist()
+        badges[str(player_name).strip().lower()] = "🔥 " + ", ".join(stats_list)
+    return badges
+
+
+def tag_player_badges(
+    df: pd.DataFrame,
+    streak_badges: dict[str, str],
+    injuries: dict[str, str],
+) -> pd.DataFrame:
+    """Append streak (🔥) and injury (❌/⚠️) badges to matching player names."""
+    if df.empty or "Player" not in df.columns or (not streak_badges and not injuries):
+        return df
+
+    def format_name(name: str) -> str:
+        key = str(name).strip().lower()
+        parts = [str(name)]
+        if key in streak_badges:
+            parts.append(f"({streak_badges[key]})")
+        if key in injuries:
+            parts.append(f"({injuries[key]})")
+        return " ".join(parts)
+
+    out = df.copy()
+    out["Player"] = out["Player"].apply(format_name)
+    return out
 
 
 def build_demo_logs() -> pd.DataFrame:
@@ -213,8 +296,107 @@ def analyze_player_thresholds(
     return summary.reset_index(drop=True)
 
 
-def render_stat_table(summary: pd.DataFrame, stat: str) -> None:
-    """Render a clean 5-column table with combined Hit Rate (e.g. '90.0% (9/10)')."""
+@st.dialog("Player Profile")
+def show_player_profile(
+    player_name: str,
+    logs_df: pd.DataFrame,
+    injuries: dict[str, str],
+    streak_badges: dict[str, str],
+) -> None:
+    """Display season averages, injury status, streaks, and last 5 games."""
+    player_logs = logs_df[
+        logs_df["PLAYER_NAME"].str.strip().str.lower() == player_name.strip().lower()
+    ].copy()
+
+    if player_logs.empty:
+        st.warning(f"No game logs found for {player_name}.")
+        return
+
+    player_logs["GAME_DATE"] = pd.to_datetime(player_logs["GAME_DATE"])
+    player_logs = player_logs.sort_values("GAME_DATE", ascending=False)
+    team = str(player_logs.iloc[0]["TEAM_ABBREVIATION"])
+
+    st.subheader(f"{player_name} ({team})")
+
+    key = player_name.strip().lower()
+    if key in injuries:
+        st.warning(f"Injury Status: {injuries[key]}")
+    else:
+        st.success("Injury Status: Healthy / Not on injury report")
+
+    if key in streak_badges:
+        st.info(f"Active Streak: {streak_badges[key]}")
+
+    if player_logs["MIN"].dtype == object:
+        player_logs["MIN_NUM"] = (
+            player_logs["MIN"]
+            .astype(str)
+            .str.split(":")
+            .str[0]
+            .pipe(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+        )
+    else:
+        player_logs["MIN_NUM"] = pd.to_numeric(
+            player_logs["MIN"], errors="coerce"
+        ).fillna(0.0)
+
+    played = player_logs[player_logs["MIN_NUM"] > 0]
+    avg_src = played if not played.empty else player_logs
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Season PTS", f"{avg_src['PTS'].mean():.1f}")
+    c2.metric("Season AST", f"{avg_src['AST'].mean():.1f}")
+    c3.metric("Season REB", f"{avg_src['REB'].mean():.1f}")
+
+    st.markdown("**Last 5 Games**")
+    last5 = player_logs.head(5).copy()
+    matchup_col = (
+        last5["MATCHUP"].astype(str)
+        if "MATCHUP" in last5.columns
+        else last5["TEAM_ABBREVIATION"].astype(str)
+    )
+    last5_view = pd.DataFrame(
+        {
+            "Date": last5["GAME_DATE"].dt.strftime("%m-%d-%Y"),
+            "Matchup": matchup_col,
+            "MIN": last5["MIN_NUM"].map(lambda x: f"{int(round(x))}"),
+            "PTS": last5["PTS"].map(lambda x: f"{int(x)}"),
+            "AST": last5["AST"].map(lambda x: f"{int(x)}"),
+            "REB": last5["REB"].map(lambda x: f"{int(x)}"),
+        }
+    )
+    st.dataframe(last5_view, use_container_width=True, hide_index=True)
+
+
+def handle_row_selection(
+    event: object,
+    display_df: pd.DataFrame,
+    table_key: str,
+    logs_df: pd.DataFrame,
+    injuries: dict[str, str],
+    streak_badges: dict[str, str],
+) -> None:
+    """Open the player profile dialog when a table row is newly tapped."""
+    rows = event.selection.rows if event and hasattr(event, "selection") else []
+    prev_rows = st.session_state.get(f"prev_{table_key}", [])
+    st.session_state[f"prev_{table_key}"] = list(rows)
+    if rows and list(rows) != prev_rows:
+        idx = rows[0]
+        if 0 <= idx < len(display_df):
+            raw_name = str(display_df.iloc[idx]["Player"])
+            clean_name = raw_name.split(" (")[0].strip()
+            show_player_profile(clean_name, logs_df, injuries, streak_badges)
+
+
+def render_stat_table(
+    summary: pd.DataFrame,
+    stat: str,
+    logs_df: pd.DataFrame,
+    injuries: dict[str, str],
+    streak_badges: dict[str, str],
+) -> None:
+    """Render a clean 5-column table with row-tap player profile support."""
     avg_col = f"Avg {stat}"
     hits_col = f"{stat} Hits"
     pct_col = f"{stat} %"
@@ -225,37 +407,141 @@ def render_stat_table(summary: pd.DataFrame, stat: str) -> None:
         {
             "Player": sorted_df["Player"],
             "Team": sorted_df["Team"],
-            "Avg": sorted_df[avg_col],
+            "Avg": sorted_df[avg_col].map(lambda x: f"{x:.1f}"),
             "Hit Rate": sorted_df[pct_col].map(lambda x: f"{x:.1f}%") + " (" + sorted_df[hits_col] + ")",
             "Fair Odds": sorted_df[odds_col],
         }
     )
 
-    st.dataframe(
+    table_key = f"table_{stat.lower()}"
+    event = st.dataframe(
         view,
+        key=table_key,
         use_container_width=True,
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
         column_config={
             "Player": st.column_config.TextColumn(width="medium"),
             "Team": st.column_config.TextColumn(width="small"),
-            "Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
+            "Avg": st.column_config.TextColumn(width="small"),
             "Hit Rate": st.column_config.TextColumn(width="small"),
             "Fair Odds": st.column_config.TextColumn(width="small"),
         },
     )
+    handle_row_selection(event, view, table_key, logs_df, injuries, streak_badges)
 
 
-def render_overview_table(summary: pd.DataFrame) -> None:
-    """Render a compact all-stats comparison table."""
+def compute_heater_streaks(
+    logs_df: pd.DataFrame,
+    stat_filter: str = "All",
+    min_streak: int = 3,
+    teams: list[str] | None = None,
+    player_query: str = "",
+    min_minutes: int = 10,
+    min_games_played: int = 4,
+) -> pd.DataFrame:
+    """
+    Find players on an active streak of outperforming their own season average
+    in consecutive most-recent games.
+    """
+    df = logs_df.copy()
+
+    if df["MIN"].dtype == object:
+        df["MIN_NUM"] = (
+            df["MIN"]
+            .astype(str)
+            .str.split(":")
+            .str[0]
+            .pipe(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+        )
+    else:
+        df["MIN_NUM"] = pd.to_numeric(df["MIN"], errors="coerce").fillna(0.0)
+
+    df = df[df["MIN_NUM"] >= min_minutes]
+
+    if teams:
+        team_set = {t.upper() for t in teams}
+        df = df[df["TEAM_ABBREVIATION"].str.upper().isin(team_set)]
+
+    if player_query.strip():
+        df = df[
+            df["PLAYER_NAME"].str.contains(player_query.strip(), case=False, na=False)
+        ]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.sort_values(["PLAYER_ID", "GAME_DATE"], ascending=[True, False])
+    stats = ["PTS", "AST", "REB"] if stat_filter == "All" else [stat_filter]
+
+    hot_rows: list[dict[str, object]] = []
+    for (_, player_name, team_abbr), group in df.groupby(
+        ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION"], sort=False
+    ):
+        if len(group) < min_games_played:
+            continue
+
+        for stat in stats:
+            vals = group[stat].astype(float).tolist()
+            season_avg = sum(vals) / len(vals)
+            streak = 0
+            for v in vals:
+                if v > season_avg:
+                    streak += 1
+                else:
+                    break
+
+            if streak >= min_streak:
+                streak_vals = vals[:streak]
+                streak_avg = sum(streak_vals) / len(streak_vals)
+                hot_rows.append(
+                    {
+                        "Player": player_name,
+                        "Team": team_abbr,
+                        "Stat": stat,
+                        "Season Avg": f"{season_avg:.1f}",
+                        "Streak": f"{streak} games",
+                        "Streak Avg": f"{streak_avg:.1f}",
+                        "Recent Games": ", ".join(str(int(v)) for v in streak_vals),
+                        "_streak_num": streak,
+                        "_avg_num": season_avg,
+                    }
+                )
+
+    if not hot_rows:
+        return pd.DataFrame()
+
+    out = (
+        pd.DataFrame(hot_rows)
+        .sort_values(["_streak_num", "_avg_num"], ascending=[False, False])
+        .drop(columns=["_streak_num", "_avg_num"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def render_overview_table(
+    summary: pd.DataFrame,
+    logs_df: pd.DataFrame,
+    injuries: dict[str, str],
+    streak_badges: dict[str, str],
+) -> None:
+    """Render a compact all-stats comparison table with row-tap profile support."""
     view = (
         summary[["Player", "Team", "PTS %", "AST %", "REB %"]]
         .sort_values(["PTS %", "AST %", "REB %"], ascending=False)
         .reset_index(drop=True)
     )
-    st.dataframe(
+    table_key = "table_all"
+    event = st.dataframe(
         view,
+        key=table_key,
         use_container_width=True,
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
         column_config={
             "PTS %": st.column_config.ProgressColumn(
                 format="%.1f%%", min_value=0, max_value=100
@@ -268,46 +554,19 @@ def render_overview_table(summary: pd.DataFrame) -> None:
             ),
         },
     )
+    handle_row_selection(event, view, table_key, logs_df, injuries, streak_badges)
 
 
 def main() -> None:
-    st.title("NBA Player Prop Hit-Rate Analyzer")
+    st.title("NBA Stats Prop")
 
-    with st.sidebar:
-        st.header("Data Source")
-        use_demo = st.toggle("Use offline sample data", value=False)
-        if st.button("Reload CSV", use_container_width=True):
-            st.cache_data.clear()
-
-        st.divider()
-        st.header("Prop Thresholds")
-        pts_line = st.slider("Points (PTS >=", min_value=5, max_value=45, value=15, step=1)
-        ast_line = st.slider("Assists (AST >=", min_value=1, max_value=15, value=4, step=1)
-        reb_line = st.slider("Rebounds (REB >=", min_value=1, max_value=18, value=5, step=1)
-
-        st.divider()
-        st.header("Sample & Filters")
-        use_full_season = st.checkbox("Use full season", value=False)
-        last_n = (
-            None
-            if use_full_season
-            else st.slider("Last N games", min_value=3, max_value=40, value=10, step=1)
-        )
-        min_minutes = st.slider("Minimum minutes played", min_value=0, max_value=30, value=10)
-
-    if use_demo:
-        logs_df = build_demo_logs()
-        st.caption("Showing built-in sample data.")
-    elif LOGS_CSV.exists():
-        logs_df = load_csv_logs(str(LOGS_CSV), LOGS_CSV.stat().st_mtime)
-        latest_game = pd.to_datetime(logs_df["GAME_DATE"]).max().strftime("%Y-%m-%d")
-        st.caption(f"Loaded `nba_logs.csv` ({len(logs_df):,} player-games, latest game: {latest_game}).")
-    else:
-        st.warning(
-            "`nba_logs.csv` was not found in this repo. Run `python update_nba_data.py` "
-            "on your PC and upload `nba_logs.csv`, or toggle **Use offline sample data**."
-        )
+    if not LOGS_CSV.exists():
+        st.warning("`nba_logs.csv` was not found in this repo. Run `python update_nba_data.py` and upload `nba_logs.csv`.")
         return
+
+    logs_df = load_csv_logs(str(LOGS_CSV), LOGS_CSV.stat().st_mtime)
+    latest_game = pd.to_datetime(logs_df["GAME_DATE"]).max().strftime("%m-%d-%Y")
+    st.caption(f"{len(logs_df):,} games played, latest game: {latest_game}")
 
     all_teams = sorted(logs_df["TEAM_ABBREVIATION"].dropna().unique().tolist())
 
@@ -315,7 +574,7 @@ def main() -> None:
     with col1:
         matchup_options = ["All Teams"]
         matchup_map: dict[str, list[str]] = {}
-        if not use_demo and MATCHUPS_CSV.exists():
+        if MATCHUPS_CSV.exists():
             for away, home in load_csv_matchups(
                 str(MATCHUPS_CSV), MATCHUPS_CSV.stat().st_mtime
             ):
@@ -334,6 +593,30 @@ def main() -> None:
     with col2:
         player_query = st.text_input("Search player name", placeholder="e.g. Brunson")
 
+    st.session_state.setdefault("pts_line", 15)
+    st.session_state.setdefault("ast_line", 4)
+    st.session_state.setdefault("reb_line", 5)
+    pts_line = int(st.session_state["pts_line"])
+    ast_line = int(st.session_state["ast_line"])
+    reb_line = int(st.session_state["reb_line"])
+
+    f_col1, f_col2 = st.columns(2)
+    with f_col1:
+        use_full_season = st.checkbox("Use full season", value=True)
+        last_n = (
+            None
+            if use_full_season
+            else st.slider("Last N games", min_value=3, max_value=40, value=10, step=1)
+        )
+    with f_col2:
+        min_minutes = st.slider("Minimum minutes played", min_value=0, max_value=30, value=10)
+
+    injuries = fetch_nba_injuries()
+    active_min_streak = int(st.session_state.get("heater_min_streak", 3))
+    streak_badges = get_player_streak_badges(
+        logs_df, min_streak=active_min_streak, min_minutes=min_minutes
+    )
+
     result = analyze_player_thresholds(
         logs_df,
         pts_threshold=pts_line,
@@ -344,28 +627,85 @@ def main() -> None:
         last_n_games=last_n,
         min_minutes=min_minutes,
     )
+    result = tag_player_badges(result, streak_badges, injuries)
 
     if result.empty:
         st.info("No players matched your current filters. Try lowering minimum minutes or widening teams.")
         return
 
-    tab_pts, tab_ast, tab_reb, tab_all = st.tabs(
+    tab_pts, tab_ast, tab_reb, tab_all, tab_heater = st.tabs(
         [
             f"Points ({pts_line}+)",
             f"Assists ({ast_line}+)",
             f"Rebounds ({reb_line}+)",
             "All Stats (Compact)",
+            "🔥 Heater Meter",
         ]
     )
 
     with tab_pts:
-        render_stat_table(result, "PTS")
+        st.slider("Points (PTS >=)", min_value=5, max_value=45, step=1, key="pts_line")
+        render_stat_table(result, "PTS", logs_df, injuries, streak_badges)
     with tab_ast:
-        render_stat_table(result, "AST")
+        st.slider("Assists (AST >=)", min_value=1, max_value=15, step=1, key="ast_line")
+        render_stat_table(result, "AST", logs_df, injuries, streak_badges)
     with tab_reb:
-        render_stat_table(result, "REB")
+        st.slider("Rebounds (REB >=)", min_value=1, max_value=18, step=1, key="reb_line")
+        render_stat_table(result, "REB", logs_df, injuries, streak_badges)
     with tab_all:
-        render_overview_table(result)
+        render_overview_table(result, logs_df, injuries, streak_badges)
+    with tab_heater:
+        h_col1, h_col2 = st.columns([2, 1])
+        with h_col1:
+            heater_stat = st.radio(
+                "Stat",
+                options=["All", "PTS", "AST", "REB"],
+                horizontal=True,
+            )
+        with h_col2:
+            min_streak = st.slider(
+                "Minimum streak (games above season avg)",
+                min_value=2,
+                max_value=10,
+                value=3,
+                step=1,
+                key="heater_min_streak",
+            )
+
+        heater_df = compute_heater_streaks(
+            logs_df,
+            stat_filter=heater_stat,
+            min_streak=min_streak,
+            teams=selected_teams or None,
+            player_query=player_query,
+            min_minutes=min_minutes,
+        )
+        heater_df = tag_player_badges(heater_df, streak_badges, injuries)
+        if heater_df.empty:
+            st.info(
+                f"No players currently have {min_streak}+ consecutive games above their season average."
+            )
+        else:
+            heater_event = st.dataframe(
+                heater_df,
+                key="table_heater",
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                column_config={
+                    "Player": st.column_config.TextColumn(width="medium"),
+                    "Team": st.column_config.TextColumn(width="small"),
+                    "Stat": st.column_config.TextColumn(width="small"),
+                    "Season Avg": st.column_config.TextColumn(width="small"),
+                    "Streak": st.column_config.TextColumn(width="small"),
+                    "Streak Avg": st.column_config.TextColumn(width="small"),
+                    "Recent Games": st.column_config.TextColumn(width="medium"),
+                },
+            )
+            handle_row_selection(
+                heater_event, heater_df, "table_heater", logs_df, injuries, streak_badges
+            )
 
 
 if __name__ == "__main__":
