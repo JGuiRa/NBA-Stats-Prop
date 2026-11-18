@@ -708,26 +708,26 @@ def main() -> None:
 
     tab_pts, tab_ast, tab_reb, tab_3pm, tab_all, tab_heater = st.tabs(
         [
-            f"Points ({pts_line}+)",
-            f"Assists ({ast_line}+)",
-            f"Rebounds ({reb_line}+)",
-            f"3-Pointers ({fg3m_line}+)",
-            "All Stats (Compact)",
+            "Points",
+            "Assists",
+            "Rebounds",
+            "3-Pointers",
+            "All Stats",
             "🔥 Heater Meter",
         ]
     )
 
     with tab_pts:
-        st.slider("Points (PTS >=)", min_value=5, max_value=45, step=1, key="pts_line")
+        st.slider("Points", min_value=5, max_value=45, step=1, key="pts_line")
         render_stat_table(result, "PTS", logs_df, injuries, streak_badges)
     with tab_ast:
-        st.slider("Assists (AST >=)", min_value=1, max_value=15, step=1, key="ast_line")
+        st.slider("Assists", min_value=1, max_value=15, step=1, key="ast_line")
         render_stat_table(result, "AST", logs_df, injuries, streak_badges)
     with tab_reb:
-        st.slider("Rebounds (REB >=)", min_value=1, max_value=18, step=1, key="reb_line")
+        st.slider("Rebounds", min_value=1, max_value=18, step=1, key="reb_line")
         render_stat_table(result, "REB", logs_df, injuries, streak_badges)
     with tab_3pm:
-        st.slider("3-Pointers (3PM >=)", min_value=1, max_value=10, step=1, key="fg3m_line")
+        st.slider("3-Pointers", min_value=1, max_value=10, step=1, key="fg3m_line")
         render_stat_table(result, "3PM", logs_df, injuries, streak_badges)
     with tab_all:
         render_overview_table(result, logs_df, injuries, streak_badges)
