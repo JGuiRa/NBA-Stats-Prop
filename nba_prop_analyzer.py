@@ -206,6 +206,7 @@ def analyze_player_thresholds(
     pts_threshold: int,
     ast_threshold: int,
     reb_threshold: int,
+    fg3m_threshold: int = 2,
     teams: list[str] | None = None,
     player_query: str = "",
     last_n_games: int | None = 10,
@@ -245,9 +246,13 @@ def analyze_player_thresholds(
     if last_n_games is not None and last_n_games > 0:
         df = df.groupby("PLAYER_ID", group_keys=False).head(last_n_games)
 
+    if "FG3M" not in df.columns:
+        df["FG3M"] = 0
+
     df["HIT_PTS"] = df["PTS"] >= pts_threshold
     df["HIT_AST"] = df["AST"] >= ast_threshold
     df["HIT_REB"] = df["REB"] >= reb_threshold
+    df["HIT_3PM"] = df["FG3M"] >= fg3m_threshold
 
     summary = (
         df.groupby(["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION"], as_index=False)
@@ -262,14 +267,18 @@ def analyze_player_thresholds(
             AVG_REB=("REB", "mean"),
             REB_HITS=("HIT_REB", "sum"),
             REB_RATE=("HIT_REB", "mean"),
+            AVG_3PM=("FG3M", "mean"),
+            FG3M_HITS=("HIT_3PM", "sum"),
+            FG3M_RATE=("HIT_3PM", "mean"),
         )
     )
+    summary = summary.rename(columns={"FG3M_HITS": "3PM_HITS", "FG3M_RATE": "3PM_RATE"})
 
     summary = summary[summary["GP"] >= min_games_played].copy()
     if summary.empty:
         return summary
 
-    for stat in ("PTS", "AST", "REB"):
+    for stat in ("PTS", "AST", "REB", "3PM"):
         summary[f"{stat} %"] = (summary[f"{stat}_RATE"] * 100).round(1)
         summary[f"{stat} Hits"] = (
             summary[f"{stat}_HITS"].astype(int).astype(str)
@@ -287,10 +296,11 @@ def analyze_player_thresholds(
             "AVG_PTS": "Avg PTS",
             "AVG_AST": "Avg AST",
             "AVG_REB": "Avg REB",
+            "AVG_3PM": "Avg 3PM",
         }
     )
 
-    for col in ("Avg PTS", "Avg AST", "Avg REB"):
+    for col in ("Avg PTS", "Avg AST", "Avg REB", "Avg 3PM"):
         summary[col] = summary[col].round(1)
 
     return summary.reset_index(drop=True)
@@ -344,13 +354,20 @@ def show_player_profile(
     played = player_logs[player_logs["MIN_NUM"] > 0]
     avg_src = played if not played.empty else player_logs
 
-    c1, c2, c3 = st.columns(3)
+    if "FG3M" not in avg_src.columns:
+        avg_src = avg_src.copy()
+        avg_src["FG3M"] = 0
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Season PTS", f"{avg_src['PTS'].mean():.1f}")
     c2.metric("Season AST", f"{avg_src['AST'].mean():.1f}")
     c3.metric("Season REB", f"{avg_src['REB'].mean():.1f}")
+    c4.metric("Season 3PM", f"{avg_src['FG3M'].mean():.1f}")
 
     st.markdown("**Last 5 Games**")
     last5 = player_logs.head(5).copy()
+    if "FG3M" not in last5.columns:
+        last5["FG3M"] = 0
     matchup_col = (
         last5["MATCHUP"].astype(str)
         if "MATCHUP" in last5.columns
@@ -364,6 +381,7 @@ def show_player_profile(
             "PTS": last5["PTS"].map(lambda x: f"{int(x)}"),
             "AST": last5["AST"].map(lambda x: f"{int(x)}"),
             "REB": last5["REB"].map(lambda x: f"{int(x)}"),
+            "3PM": last5["FG3M"].map(lambda x: f"{int(x)}"),
         }
     )
     st.dataframe(last5_view, use_container_width=True, hide_index=True)
@@ -407,7 +425,7 @@ def render_stat_table(
         {
             "Player": sorted_df["Player"],
             "Team": sorted_df["Team"],
-            "Avg": sorted_df[avg_col].map(lambda x: f"{x:.1f}"),
+            "Avg": sorted_df[avg_col].round(1),
             "Hit Rate": sorted_df[pct_col].map(lambda x: f"{x:.1f}%") + " (" + sorted_df[hits_col] + ")",
             "Fair Odds": sorted_df[odds_col],
         }
@@ -424,7 +442,7 @@ def render_stat_table(
         column_config={
             "Player": st.column_config.TextColumn(width="medium"),
             "Team": st.column_config.TextColumn(width="small"),
-            "Avg": st.column_config.TextColumn(width="small"),
+            "Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
             "Hit Rate": st.column_config.TextColumn(width="small"),
             "Fair Odds": st.column_config.TextColumn(width="small"),
         },
@@ -473,8 +491,12 @@ def compute_heater_streaks(
     if df.empty:
         return pd.DataFrame()
 
+    if "FG3M" not in df.columns:
+        df["FG3M"] = 0
+
     df = df.sort_values(["PLAYER_ID", "GAME_DATE"], ascending=[True, False])
-    stats = ["PTS", "AST", "REB"] if stat_filter == "All" else [stat_filter]
+    stat_col_map = {"PTS": "PTS", "AST": "AST", "REB": "REB", "3PM": "FG3M"}
+    stats = ["PTS", "AST", "REB", "3PM"] if stat_filter == "All" else [stat_filter]
 
     hot_rows: list[dict[str, object]] = []
     for (_, player_name, team_abbr), group in df.groupby(
@@ -484,7 +506,8 @@ def compute_heater_streaks(
             continue
 
         for stat in stats:
-            vals = group[stat].astype(float).tolist()
+            col_name = stat_col_map[stat]
+            vals = group[col_name].astype(float).tolist()
             season_avg = sum(vals) / len(vals)
             streak = 0
             for v in vals:
@@ -501,9 +524,9 @@ def compute_heater_streaks(
                         "Player": player_name,
                         "Team": team_abbr,
                         "Stat": stat,
-                        "Season Avg": f"{season_avg:.1f}",
-                        "Streak": f"{streak} games",
-                        "Streak Avg": f"{streak_avg:.1f}",
+                        "Season Avg": round(season_avg, 1),
+                        "Streak": int(streak),
+                        "Streak Avg": round(streak_avg, 1),
                         "Recent Games": ", ".join(str(int(v)) for v in streak_vals),
                         "_streak_num": streak,
                         "_avg_num": season_avg,
@@ -530,8 +553,8 @@ def render_overview_table(
 ) -> None:
     """Render a compact all-stats comparison table with row-tap profile support."""
     view = (
-        summary[["Player", "Team", "PTS %", "AST %", "REB %"]]
-        .sort_values(["PTS %", "AST %", "REB %"], ascending=False)
+        summary[["Player", "Team", "PTS %", "AST %", "REB %", "3PM %"]]
+        .sort_values(["PTS %", "AST %", "REB %", "3PM %"], ascending=False)
         .reset_index(drop=True)
     )
     table_key = "table_all"
@@ -550,6 +573,9 @@ def render_overview_table(
                 format="%.1f%%", min_value=0, max_value=100
             ),
             "REB %": st.column_config.ProgressColumn(
+                format="%.1f%%", min_value=0, max_value=100
+            ),
+            "3PM %": st.column_config.ProgressColumn(
                 format="%.1f%%", min_value=0, max_value=100
             ),
         },
@@ -574,21 +600,43 @@ def main() -> None:
     with col1:
         matchup_options = ["All Teams"]
         matchup_map: dict[str, list[str]] = {}
+        today_teams: list[str] = []
         if MATCHUPS_CSV.exists():
-            for away, home in load_csv_matchups(
+            matchups_list = load_csv_matchups(
                 str(MATCHUPS_CSV), MATCHUPS_CSV.stat().st_mtime
-            ):
-                label = f"{away} @ {home}"
-                matchup_options.append(label)
-                matchup_map[label] = [away, home]
+            )
+            if matchups_list:
+                today_teams = sorted(
+                    {abbr for pair in matchups_list for abbr in pair}
+                )
+                for away, home in matchups_list:
+                    label = f"{away} @ {home}"
+                    matchup_options.append(label)
+                    matchup_map[label] = [away, home]
 
-        selected_matchup = st.selectbox("Matchup", options=matchup_options)
-        default_teams = matchup_map.get(selected_matchup, [])
+        playing_today_only = st.toggle(
+            "Playing today",
+            value=False,
+            disabled=not bool(today_teams),
+            help="Show all players on teams playing today.",
+        )
+        selected_matchup = st.selectbox(
+            "Matchup",
+            options=matchup_options,
+            disabled=playing_today_only,
+        )
+        default_teams = (
+            today_teams
+            if playing_today_only
+            else matchup_map.get(selected_matchup, [])
+        )
         selected_teams = st.multiselect(
             "Or filter specific teams",
             options=all_teams,
             default=default_teams,
+            disabled=playing_today_only,
         )
+        active_teams = today_teams if playing_today_only else (selected_teams or None)
 
     with col2:
         player_query = st.text_input("Search player name", placeholder="e.g. Brunson")
@@ -596,9 +644,11 @@ def main() -> None:
     st.session_state.setdefault("pts_line", 15)
     st.session_state.setdefault("ast_line", 4)
     st.session_state.setdefault("reb_line", 5)
+    st.session_state.setdefault("fg3m_line", 2)
     pts_line = int(st.session_state["pts_line"])
     ast_line = int(st.session_state["ast_line"])
     reb_line = int(st.session_state["reb_line"])
+    fg3m_line = int(st.session_state["fg3m_line"])
 
     f_col1, f_col2 = st.columns(2)
     with f_col1:
@@ -622,7 +672,8 @@ def main() -> None:
         pts_threshold=pts_line,
         ast_threshold=ast_line,
         reb_threshold=reb_line,
-        teams=selected_teams or None,
+        fg3m_threshold=fg3m_line,
+        teams=active_teams,
         player_query=player_query,
         last_n_games=last_n,
         min_minutes=min_minutes,
@@ -633,11 +684,12 @@ def main() -> None:
         st.info("No players matched your current filters. Try lowering minimum minutes or widening teams.")
         return
 
-    tab_pts, tab_ast, tab_reb, tab_all, tab_heater = st.tabs(
+    tab_pts, tab_ast, tab_reb, tab_3pm, tab_all, tab_heater = st.tabs(
         [
             f"Points ({pts_line}+)",
             f"Assists ({ast_line}+)",
             f"Rebounds ({reb_line}+)",
+            f"3-Pointers ({fg3m_line}+)",
             "All Stats (Compact)",
             "🔥 Heater Meter",
         ]
@@ -652,6 +704,9 @@ def main() -> None:
     with tab_reb:
         st.slider("Rebounds (REB >=)", min_value=1, max_value=18, step=1, key="reb_line")
         render_stat_table(result, "REB", logs_df, injuries, streak_badges)
+    with tab_3pm:
+        st.slider("3-Pointers (3PM >=)", min_value=1, max_value=10, step=1, key="fg3m_line")
+        render_stat_table(result, "3PM", logs_df, injuries, streak_badges)
     with tab_all:
         render_overview_table(result, logs_df, injuries, streak_badges)
     with tab_heater:
@@ -659,7 +714,7 @@ def main() -> None:
         with h_col1:
             heater_stat = st.radio(
                 "Stat",
-                options=["All", "PTS", "AST", "REB"],
+                options=["All", "PTS", "AST", "REB", "3PM"],
                 horizontal=True,
             )
         with h_col2:
@@ -676,7 +731,7 @@ def main() -> None:
             logs_df,
             stat_filter=heater_stat,
             min_streak=min_streak,
-            teams=selected_teams or None,
+            teams=active_teams,
             player_query=player_query,
             min_minutes=min_minutes,
         )
@@ -697,9 +752,9 @@ def main() -> None:
                     "Player": st.column_config.TextColumn(width="medium"),
                     "Team": st.column_config.TextColumn(width="small"),
                     "Stat": st.column_config.TextColumn(width="small"),
-                    "Season Avg": st.column_config.TextColumn(width="small"),
-                    "Streak": st.column_config.TextColumn(width="small"),
-                    "Streak Avg": st.column_config.TextColumn(width="small"),
+                    "Season Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
+                    "Streak": st.column_config.NumberColumn(format="%d games", width="small"),
+                    "Streak Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
                     "Recent Games": st.column_config.TextColumn(width="medium"),
                 },
             )
