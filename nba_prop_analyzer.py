@@ -384,7 +384,7 @@ def show_player_profile(
             "3PM": last5["FG3M"].map(lambda x: f"{int(x)}"),
         }
     )
-    st.dataframe(last5_view, use_container_width=True, hide_index=True)
+    st.dataframe(last5_view, width="stretch", hide_index=True)
 
 
 def handle_row_selection(
@@ -435,7 +435,7 @@ def render_stat_table(
     event = st.dataframe(
         view,
         key=table_key,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -454,6 +454,7 @@ def compute_heater_streaks(
     logs_df: pd.DataFrame,
     stat_filter: str = "All",
     min_streak: int = 3,
+    min_heat_pct: float = 15.0,
     teams: list[str] | None = None,
     player_query: str = "",
     min_minutes: int = 10,
@@ -509,6 +510,8 @@ def compute_heater_streaks(
             col_name = stat_col_map[stat]
             vals = group[col_name].astype(float).tolist()
             season_avg = sum(vals) / len(vals)
+            if season_avg <= 0:
+                continue
             streak = 0
             for v in vals:
                 if v > season_avg:
@@ -519,6 +522,9 @@ def compute_heater_streaks(
             if streak >= min_streak:
                 streak_vals = vals[:streak]
                 streak_avg = sum(streak_vals) / len(streak_vals)
+                heat_pct = ((streak_avg - season_avg) / season_avg) * 100.0
+                if heat_pct < min_heat_pct:
+                    continue
                 hot_rows.append(
                     {
                         "Player": player_name,
@@ -527,9 +533,10 @@ def compute_heater_streaks(
                         "Season Avg": round(season_avg, 1),
                         "Streak": int(streak),
                         "Streak Avg": round(streak_avg, 1),
-                        "Recent Games": ", ".join(str(int(v)) for v in streak_vals),
+                        "Heat %": round(heat_pct, 1),
+                        "Recent Games": ", ".join(str(int(v)) for v in reversed(streak_vals)),
                         "_streak_num": streak,
-                        "_avg_num": season_avg,
+                        "_heat_num": heat_pct,
                     }
                 )
 
@@ -538,8 +545,8 @@ def compute_heater_streaks(
 
     out = (
         pd.DataFrame(hot_rows)
-        .sort_values(["_streak_num", "_avg_num"], ascending=[False, False])
-        .drop(columns=["_streak_num", "_avg_num"])
+        .sort_values(["_streak_num", "_heat_num"], ascending=[False, False])
+        .drop(columns=["_streak_num", "_heat_num"])
         .reset_index(drop=True)
     )
     return out
@@ -561,7 +568,7 @@ def render_overview_table(
     event = st.dataframe(
         view,
         key=table_key,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -596,50 +603,72 @@ def main() -> None:
 
     all_teams = sorted(logs_df["TEAM_ABBREVIATION"].dropna().unique().tolist())
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        matchup_options = ["All Teams"]
-        matchup_map: dict[str, list[str]] = {}
-        today_teams: list[str] = []
-        if MATCHUPS_CSV.exists():
-            matchups_list = load_csv_matchups(
-                str(MATCHUPS_CSV), MATCHUPS_CSV.stat().st_mtime
-            )
-            if matchups_list:
-                today_teams = sorted(
-                    {abbr for pair in matchups_list for abbr in pair}
-                )
-                for away, home in matchups_list:
-                    label = f"{away} @ {home}"
-                    matchup_options.append(label)
-                    matchup_map[label] = [away, home]
-
-        playing_today_only = st.toggle(
-            "Playing today",
-            value=False,
-            disabled=not bool(today_teams),
-            help="Show all players on teams playing today.",
+    matchup_options = ["All Teams"]
+    matchup_map: dict[str, list[str]] = {}
+    today_teams: list[str] = []
+    if MATCHUPS_CSV.exists():
+        matchups_list = load_csv_matchups(
+            str(MATCHUPS_CSV), MATCHUPS_CSV.stat().st_mtime
         )
+        if matchups_list:
+            today_teams = sorted(
+                {abbr for pair in matchups_list for abbr in pair}
+            )
+            for away, home in matchups_list:
+                label = f"{away} @ {home}"
+                matchup_options.append(label)
+                matchup_map[label] = [away, home]
+
+    st.session_state.setdefault("playing_today_only", False)
+    playing_today_active = bool(st.session_state["playing_today_only"]) and bool(today_teams)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
         selected_matchup = st.selectbox(
             "Matchup",
             options=matchup_options,
-            disabled=playing_today_only,
+            disabled=playing_today_active,
         )
+    with c2:
         default_teams = (
             today_teams
-            if playing_today_only
+            if playing_today_active
             else matchup_map.get(selected_matchup, [])
         )
         selected_teams = st.multiselect(
-            "Or filter specific teams",
+            "Filter specific teams",
             options=all_teams,
             default=default_teams,
-            disabled=playing_today_only,
+            disabled=playing_today_active,
         )
-        active_teams = today_teams if playing_today_only else (selected_teams or None)
-
-    with col2:
+    with c3:
         player_query = st.text_input("Search player name", placeholder="e.g. Brunson")
+
+    t1, t2, t3, t4 = st.columns([1, 1, 1, 2])
+    with t1:
+        playing_today_only = st.toggle(
+            "Playing today",
+            disabled=not bool(today_teams),
+            key="playing_today_only",
+            help="Show all players on teams playing today.",
+        )
+    with t2:
+        hide_injured = st.toggle(
+            "Remove injured players",
+            value=False,
+            help="Hide players currently listed on the NBA injury report.",
+        )
+    with t3:
+        use_full_season = st.toggle("Full Season", value=True)
+    with t4:
+        min_minutes = st.slider("Minutes Played", min_value=0, max_value=30, value=15)
+        last_n = (
+            None
+            if use_full_season
+            else st.slider("Last N games", min_value=3, max_value=40, value=10, step=1)
+        )
+
+    active_teams = today_teams if playing_today_only else (selected_teams or None)
 
     st.session_state.setdefault("pts_line", 15)
     st.session_state.setdefault("ast_line", 4)
@@ -649,17 +678,6 @@ def main() -> None:
     ast_line = int(st.session_state["ast_line"])
     reb_line = int(st.session_state["reb_line"])
     fg3m_line = int(st.session_state["fg3m_line"])
-
-    f_col1, f_col2 = st.columns(2)
-    with f_col1:
-        use_full_season = st.checkbox("Use full season", value=True)
-        last_n = (
-            None
-            if use_full_season
-            else st.slider("Last N games", min_value=3, max_value=40, value=10, step=1)
-        )
-    with f_col2:
-        min_minutes = st.slider("Minimum minutes played", min_value=0, max_value=30, value=10)
 
     injuries = fetch_nba_injuries()
     active_min_streak = int(st.session_state.get("heater_min_streak", 3))
@@ -678,6 +696,10 @@ def main() -> None:
         last_n_games=last_n,
         min_minutes=min_minutes,
     )
+    if hide_injured and injuries and not result.empty:
+        result = result[
+            ~result["Player"].astype(str).str.strip().str.lower().isin(injuries)
+        ].reset_index(drop=True)
     result = tag_player_badges(result, streak_badges, injuries)
 
     if result.empty:
@@ -710,41 +732,53 @@ def main() -> None:
     with tab_all:
         render_overview_table(result, logs_df, injuries, streak_badges)
     with tab_heater:
-        h_col1, h_col2 = st.columns([2, 1])
+        heater_stat = st.radio(
+            "Stat",
+            options=["All", "PTS", "AST", "REB", "3PM"],
+            horizontal=True,
+        )
+        h_col1, h_col2 = st.columns(2)
         with h_col1:
-            heater_stat = st.radio(
-                "Stat",
-                options=["All", "PTS", "AST", "REB", "3PM"],
-                horizontal=True,
-            )
-        with h_col2:
             min_streak = st.slider(
-                "Minimum streak (games above season avg)",
+                "Minimum streak",
                 min_value=2,
                 max_value=10,
                 value=3,
                 step=1,
                 key="heater_min_streak",
             )
+        with h_col2:
+            min_heat_pct = st.slider(
+                "Min Heat Margin (%)",
+                min_value=0,
+                max_value=60,
+                value=15,
+                step=5,
+            )
 
         heater_df = compute_heater_streaks(
             logs_df,
             stat_filter=heater_stat,
             min_streak=min_streak,
+            min_heat_pct=float(min_heat_pct),
             teams=active_teams,
             player_query=player_query,
             min_minutes=min_minutes,
         )
+        if hide_injured and injuries and not heater_df.empty:
+            heater_df = heater_df[
+                ~heater_df["Player"].astype(str).str.strip().str.lower().isin(injuries)
+            ].reset_index(drop=True)
         heater_df = tag_player_badges(heater_df, streak_badges, injuries)
         if heater_df.empty:
             st.info(
-                f"No players currently have {min_streak}+ consecutive games above their season average."
+                f"No players matched {min_streak}+ games and {min_heat_pct}%+ heat."
             )
         else:
             heater_event = st.dataframe(
                 heater_df,
                 key="table_heater",
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 on_select="rerun",
                 selection_mode="single-row",
@@ -755,6 +789,7 @@ def main() -> None:
                     "Season Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
                     "Streak": st.column_config.NumberColumn(format="%d games", width="small"),
                     "Streak Avg": st.column_config.NumberColumn(format="%.1f", width="small"),
+                    "Heat %": st.column_config.NumberColumn(format="+%.1f%%", width="small"),
                     "Recent Games": st.column_config.TextColumn(width="medium"),
                 },
             )
