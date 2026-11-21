@@ -2,9 +2,9 @@
 
 on:
   schedule:
-    # Runs every day at 15:00 UTC (10:00 AM EST / 11:00 AM EDT)
-    - cron: '0 15 * * *'
-  workflow_dispatch: # Adds a manual "Run workflow" button in GitHub
+    # Runs every day at 08:00 UTC (3:00 AM EST / 4:00 AM EDT)
+    - cron: '0 8 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
